@@ -56,6 +56,7 @@ from .eflib.connection import (
 from .eflib.exceptions import AuthErrors, UnsupportedBluetoothProtocol
 from .eflib.logging_util import ConnectionLog
 from .issues import create_charging_minimum_issue
+from .cloud_fallback import async_try_setup_cloud_fallback
 from .proxy import connect_gate, wait_for_preferred_proxy
 
 PLATFORMS: list[Platform] = [
@@ -100,115 +101,162 @@ async def async_setup_entry(hass: HomeAssistant, entry: DeviceConfigEntry) -> bo
             },
         )
 
-    if not bluetooth.async_address_present(hass, address):
-        _register_reappear_callback(hass, entry, address)
-        raise ConfigEntryNotReady(translation_key="device_not_present")
-
-    _cancel_reappear_callback(hass, entry)
-
-    _LOGGER.debug("Connecting Device")
-    device: eflib.DeviceBase | None = getattr(entry, "runtime_data", None)
-    discovery_info = bluetooth.async_last_service_info(hass, address, connectable=True)
-
-    if device is None:
-        device = eflib.NewDevice(discovery_info.device, discovery_info.advertisement)
-        if device is None:
-            raise ConfigEntryNotReady(translation_key="unable_to_create_device")
-
-        entry.runtime_data = device
-    elif discovery_info is not None:
-        device.update_ble_device(discovery_info.device)
-
-    diag_options = merged_options.get(CONF_DIAGNOSTICS_OPTIONS, {})
-    packet_collection_enabled = diag_options.get(
-        CONF_COLLECT_PACKETS, eflib.is_unsupported(device)
-    )
-    diagnostics_on_exception = diag_options.get(CONF_DIAGNOSTICS_ON_EXCEPTION, False)
-
-    advanced = merged_options.get(CONF_ADVANCED_CONNECTION_OPTIONS, {})
-    timeout = advanced.get(CONF_CONNECTION_TIMEOUT, DEFAULT_CONNECTION_TIMEOUT)
-    connection_delay = advanced.get(CONF_CONNECTION_DELAY, DEFAULT_CONNECTION_DELAY)
-    preferred_proxy = advanced.get(CONF_PREFERRED_PROXY) or NO_PREFERRED_PROXY
-    options = Connection.Options(
-        timeout=timeout,
-        bluez_start_notify=advanced.get(CONF_BLUEZ_START_NOTIFY, False),
-    )
     issue_id = f"{entry.entry_id}_max_connection_attempts"
 
-    preference_wait = (
-        advanced.get(CONF_PREFERRED_PROXY_TIMEOUT, DEFAULT_PREFERRED_PROXY_TIMEOUT)
-        if preferred_proxy != NO_PREFERRED_PROXY
-        else 0.0
-    )
-
-    try:
-        async with connect_gate(
-            hass, device.name, connection_delay, timeout, preference_wait
-        ):
-            if preference_wait:
-                await wait_for_preferred_proxy(
-                    hass, address, device.name, preferred_proxy, preference_wait
-                )
-            await (
-                device.with_update_period(update_period)
-                .with_logging_options(ConfLogOptions.from_config(merged_options))
-                .with_advanced_options(merged_options.get(CONF_DEVICE_OPTIONS, {}))
-                .with_disabled_reconnect()
-                .with_packet_version(packet_version.to_num())
-                .with_enabled_packet_diagnostics(packet_collection_enabled)
-                .with_diagnostics_on_exception(diagnostics_on_exception)
-                .with_connection_options(options)
-                .connect(
-                    user_id=user_id,
-                    max_attempts=0 if eflib.is_solar_only(device) else None,
-                )
-            )
-        async with asyncio.timeout(timeout):
-            state = await device.wait_until_authenticated_or_error(raise_on_error=True)
-    except (
-        ConnectionTimeout,
-        BleakError,
-        TimeoutError,
-        UnsupportedBluetoothProtocol,
-    ) as e:
-        await device.disconnect()
-        raise ConfigEntryNotReady(
-            translation_key="could_not_connect",
-            translation_placeholders={"time": str(timeout), "error_msg": str(e)},
-        ) from e
-    except AuthErrors.BaseException as e:
-        raise ConfigEntryNotReady(translation_key="authentication_failed") from e
-    except MaxConnectionAttemptsReached as e:
-        await device.disconnect()
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            issue_id,
-            is_fixable=False,
-            severity=ir.IssueSeverity.ERROR,
-            translation_key="max_connection_attempts_reached",
-            translation_placeholders={
-                "device_name": device.name,
-                "attempts": str(e.attempts),
-            },
+    if not bluetooth.async_address_present(hass, address):
+        _register_reappear_callback(hass, entry, address, min_delay=0.0)
+        device = await async_try_setup_cloud_fallback(
+            hass, entry, address, update_period, merged_options
         )
-        raise ConfigEntryError(
-            translation_key="could_not_connect_no_retry",
-            translation_placeholders={"attempts": str(e.attempts)},
-        ) from e
-    except Exception as e:
-        _LOGGER.exception("Unknown error")
-        await device.disconnect()
-        raise ConfigEntryNotReady(
-            translation_key="unknown_error", translation_placeholders={"error": str(e)}
-        ) from e
+        if device is None:
+            raise ConfigEntryNotReady(translation_key="device_not_present")
+        _LOGGER.info(
+            "BLE device %s not advertising; running via ecoflow_energy Cloud WSS fallback",
+            address,
+        )
     else:
-        if not state.authenticated:
+        _cancel_reappear_callback(hass, entry)
+
+        _LOGGER.debug("Connecting Device")
+        device: eflib.DeviceBase | None = getattr(entry, "runtime_data", None)
+        discovery_info = bluetooth.async_last_service_info(
+            hass, address, connectable=True
+        )
+
+        if device is None:
+            device = eflib.NewDevice(
+                discovery_info.device, discovery_info.advertisement
+            )
+            if device is None:
+                raise ConfigEntryNotReady(translation_key="unable_to_create_device")
+
+            entry.runtime_data = device
+        elif discovery_info is not None:
+            device.update_ble_device(discovery_info.device)
+
+        diag_options = merged_options.get(CONF_DIAGNOSTICS_OPTIONS, {})
+        packet_collection_enabled = diag_options.get(
+            CONF_COLLECT_PACKETS, eflib.is_unsupported(device)
+        )
+        diagnostics_on_exception = diag_options.get(
+            CONF_DIAGNOSTICS_ON_EXCEPTION, False
+        )
+
+        advanced = merged_options.get(CONF_ADVANCED_CONNECTION_OPTIONS, {})
+        timeout = advanced.get(CONF_CONNECTION_TIMEOUT, DEFAULT_CONNECTION_TIMEOUT)
+        connection_delay = advanced.get(
+            CONF_CONNECTION_DELAY, DEFAULT_CONNECTION_DELAY
+        )
+        preferred_proxy = advanced.get(CONF_PREFERRED_PROXY) or NO_PREFERRED_PROXY
+        options = Connection.Options(
+            timeout=timeout,
+            bluez_start_notify=advanced.get(CONF_BLUEZ_START_NOTIFY, False),
+        )
+
+        preference_wait = (
+            advanced.get(
+                CONF_PREFERRED_PROXY_TIMEOUT, DEFAULT_PREFERRED_PROXY_TIMEOUT
+            )
+            if preferred_proxy != NO_PREFERRED_PROXY
+            else 0.0
+        )
+
+        try:
+            async with connect_gate(
+                hass, device.name, connection_delay, timeout, preference_wait
+            ):
+                if preference_wait:
+                    await wait_for_preferred_proxy(
+                        hass, address, device.name, preferred_proxy, preference_wait
+                    )
+                await (
+                    device.with_update_period(update_period)
+                    .with_logging_options(ConfLogOptions.from_config(merged_options))
+                    .with_advanced_options(merged_options.get(CONF_DEVICE_OPTIONS, {}))
+                    .with_disabled_reconnect()
+                    .with_packet_version(packet_version.to_num())
+                    .with_enabled_packet_diagnostics(packet_collection_enabled)
+                    .with_diagnostics_on_exception(diagnostics_on_exception)
+                    .with_connection_options(options)
+                    .connect(
+                        user_id=user_id,
+                        max_attempts=0 if eflib.is_solar_only(device) else None,
+                    )
+                )
+            async with asyncio.timeout(timeout):
+                state = await device.wait_until_authenticated_or_error(
+                    raise_on_error=True
+                )
+        except (
+            ConnectionTimeout,
+            BleakError,
+            TimeoutError,
+            UnsupportedBluetoothProtocol,
+        ) as e:
+            await device.disconnect()
+            _register_reappear_callback(hass, entry, address, min_delay=120.0)
+            fallback_dev = await async_try_setup_cloud_fallback(
+                hass, entry, address, update_period, merged_options
+            )
+            if fallback_dev is None:
+                raise ConfigEntryNotReady(
+                    translation_key="could_not_connect",
+                    translation_placeholders={"time": str(timeout), "error_msg": str(e)},
+                ) from e
+            device = fallback_dev
+            _LOGGER.warning(
+                "BLE connection to %s failed (%s); running via ecoflow_energy Cloud WSS fallback",
+                address,
+                e,
+            )
+        except AuthErrors.BaseException as e:
+            raise ConfigEntryNotReady(translation_key="authentication_failed") from e
+        except MaxConnectionAttemptsReached as e:
+            await device.disconnect()
+            _register_reappear_callback(hass, entry, address, min_delay=120.0)
+            fallback_dev = await async_try_setup_cloud_fallback(
+                hass, entry, address, update_period, merged_options
+            )
+            if fallback_dev is None:
+                ir.async_create_issue(
+                    hass,
+                    DOMAIN,
+                    issue_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key="max_connection_attempts_reached",
+                    translation_placeholders={
+                        "device_name": device.name,
+                        "attempts": str(e.attempts),
+                    },
+                )
+                raise ConfigEntryError(
+                    translation_key="could_not_connect_no_retry",
+                    translation_placeholders={"attempts": str(e.attempts)},
+                ) from e
+            device = fallback_dev
+            _LOGGER.warning(
+                "BLE max connection attempts reached for %s; running via ecoflow_energy Cloud WSS fallback",
+                address,
+            )
+        except Exception as e:
+            _LOGGER.exception("Unknown error")
             await device.disconnect()
             raise ConfigEntryNotReady(
-                translation_key="failed_after_successful_connection",
-                translation_placeholders={"last_state": state},
-            )
+                translation_key="unknown_error",
+                translation_placeholders={"error": str(e)},
+            ) from e
+        else:
+            if not state.authenticated:
+                await device.disconnect()
+                raise ConfigEntryNotReady(
+                    translation_key="failed_after_successful_connection",
+                    translation_placeholders={"last_state": state},
+                )
+            old_bridge = getattr(device, "_cloud_bridge", None)
+            if old_bridge is not None:
+                old_bridge.detach()
+                setattr(device, "_cloud_bridge", None)
     ir.async_delete_issue(hass, DOMAIN, issue_id)
 
     _LOGGER.debug("Creating entities")
@@ -295,20 +343,32 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
 
 def _register_reappear_callback(
-    hass: HomeAssistant, entry: ConfigEntry, address: str
+    hass: HomeAssistant, entry: ConfigEntry, address: str, min_delay: float = 0.0
 ) -> None:
     callbacks: dict[str, Callable] = hass.data.setdefault(_REAPPEAR_CALLBACKS_KEY, {})
 
     if entry.entry_id in callbacks:
         return
 
+    registered_at = asyncio.get_running_loop().time()
+    initializing = True
+
     def _on_device_reappear(
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
+        nonlocal initializing
+        if initializing:
+            return
+        if (
+            min_delay > 0
+            and (asyncio.get_running_loop().time() - registered_at) < min_delay
+        ):
+            return
         _LOGGER.info(
-            "Device %s reappeared via BLE advertisement, scheduling reload",
+            "Device %s reappeared via BLE advertisement (rssi=%s), scheduling reload",
             address,
+            getattr(service_info, "rssi", None),
         )
         _cancel_reappear_callback(hass, entry)
         hass.config_entries.async_schedule_reload(entry.entry_id)
@@ -317,10 +377,15 @@ def _register_reappear_callback(
         hass,
         _on_device_reappear,
         BluetoothCallbackMatcher(address=address, connectable=True),
-        BluetoothScanningMode.PASSIVE,
+        BluetoothScanningMode.ACTIVE,
     )
+    initializing = False
     callbacks[entry.entry_id] = cancel
-    _LOGGER.debug("Registered BLE reappear callback for %s", address)
+    _LOGGER.debug(
+        "Registered active BLE reappear callback for %s (min_delay=%ss)",
+        address,
+        min_delay,
+    )
 
 
 def _cancel_reappear_callback(hass: HomeAssistant, entry: ConfigEntry) -> None:

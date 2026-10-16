@@ -151,7 +151,10 @@ class DeviceBase(abc.ABC):
 
     @property
     def is_connected(self) -> bool:
-        return self._conn is not None and self._conn.is_connected
+        if self._conn is not None and self._conn.is_connected:
+            return True
+        cloud_bridge = getattr(self, "_cloud_bridge", None)
+        return cloud_bridge is not None and cloud_bridge.is_available
 
     def update_ble_device(self, ble_dev: BLEDevice):
         self._ble_dev = ble_dev
@@ -168,7 +171,12 @@ class DeviceBase(abc.ABC):
 
     @property
     def connection_state(self):
-        return None if self._conn is None else self._conn._connection_state
+        if self._conn is not None:
+            return self._conn._connection_state
+        cloud_bridge = getattr(self, "_cloud_bridge", None)
+        if cloud_bridge is not None and cloud_bridge.is_available:
+            return ConnectionState.AUTHENTICATED
+        return None
 
     def set_connection_state(
         self,
@@ -228,6 +236,20 @@ class DeviceBase(abc.ABC):
             Raise instead of dropping the packet when it cannot be delivered.
         """
         conn = self._conn
+        if conn is not None and conn.is_connected:
+            await conn.send_packet(
+                packet,
+                wait_for_response=wait_for_response,
+                raise_on_failure=raise_on_failure,
+            )
+            return
+        cloud_bridge = getattr(self, "_cloud_bridge", None)
+        if cloud_bridge is not None and cloud_bridge.is_available:
+            await cloud_bridge.async_send_packet(
+                packet,
+                raise_on_failure=raise_on_failure,
+            )
+            return
         if conn is None:
             if raise_on_failure:
                 raise NotConnectedError(
@@ -265,9 +287,24 @@ class DeviceBase(abc.ABC):
         """
         # `_conn` is None during a disconnect/reconnect window; any pending callback
         # would be cancelled on disconnect anyway, so there is nothing to schedule
-        if self._conn is None:
+        if self._conn is not None:
+            self._conn.call_later(delay, callback, key)
             return
-        self._conn.call_later(delay, callback, key)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        timers: dict[str, asyncio.TimerHandle] | None = getattr(
+            self, "_fallback_timers", None
+        )
+        if timers is None:
+            timers = {}
+            self._fallback_timers = timers
+        if key is not None and (prev := timers.pop(key, None)) is not None:
+            prev.cancel()
+        handle = loop.call_later(delay, callback)
+        if key is not None:
+            timers[key] = handle
 
     def with_update_period(self, period: int):
         self._update_period = period
@@ -383,8 +420,21 @@ class DeviceBase(abc.ABC):
         self.connection_log.append(state, reason)
 
     async def disconnect(self):
+        cloud_bridge = getattr(self, "_cloud_bridge", None)
+        if cloud_bridge is not None:
+            try:
+                cloud_bridge.detach()
+            except Exception:
+                pass
+            self._cloud_bridge = None
+        timers: dict[str, asyncio.TimerHandle] | None = getattr(
+            self, "_fallback_timers", None
+        )
+        if timers:
+            for handle in timers.values():
+                handle.cancel()
+            timers.clear()
         if self._conn is None:
-            self._logger.error("Device has no connection")
             return
 
         await self._conn.disconnect(reason=caller_chain())
