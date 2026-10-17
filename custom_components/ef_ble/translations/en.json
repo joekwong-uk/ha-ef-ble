@@ -430,6 +430,9 @@
       },
       "lv_solar_low_voltage": {
         "name": "LV Solar Voltage Low"
+      },
+      "bluetooth_connected": {
+        "name": "Bluetooth Connected"
       }
     },
     "sensor": {

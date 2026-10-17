@@ -125,6 +125,7 @@ _BINARY_SENSORS: Final[dict[str, BinarySensorEntityDescription]] = {
     "error_happened": problem("error", entity_category=EntityCategory.DIAGNOSTIC),
     "plugged_in_ac": plug(),
     "battery_connected": connectivity(),
+    "bluetooth_connected": connectivity(translation_key="bluetooth_connected", entity_category=EntityCategory.DIAGNOSTIC, enabled=True),
     "solar_connected": connectivity(),
     "fan_running": _make_desc(
         BinarySensorDeviceClass.RUNNING,

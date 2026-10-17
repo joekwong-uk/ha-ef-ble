@@ -150,6 +150,11 @@ class DeviceBase(abc.ABC):
         return self._sn is not None
 
     @property
+    def bluetooth_connected(self) -> bool:
+        conn = getattr(self, "_conn", None)
+        return conn is not None and getattr(conn, "is_connected", False)
+
+    @property
     def is_connected(self) -> bool:
         if self._conn is not None and self._conn.is_connected:
             return True
@@ -418,6 +423,7 @@ class DeviceBase(abc.ABC):
     def _append_state_to_log(self, state: ConnectionState) -> None:
         reason = self._conn.state_reason if self._conn is not None else None
         self.connection_log.append(state, reason)
+        self.update_state("bluetooth_connected", self.bluetooth_connected)
 
     async def disconnect(self):
         cloud_bridge = getattr(self, "_cloud_bridge", None)
@@ -434,6 +440,7 @@ class DeviceBase(abc.ABC):
             for handle in timers.values():
                 handle.cancel()
             timers.clear()
+        self.update_state("bluetooth_connected", False)
         if self._conn is None:
             return
 

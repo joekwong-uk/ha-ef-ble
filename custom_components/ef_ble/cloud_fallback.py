@@ -89,13 +89,10 @@ def find_ecoflow_energy_coordinator(hass: HomeAssistant, serial_number: str) -> 
     return None
 
 
-def create_device_from_registry(hass: HomeAssistant, address: str) -> DeviceBase | None:
+def create_device_from_registry(hass: HomeAssistant, address: str, entry_id: str | None = None) -> DeviceBase | None:
     """Instantiate an eflib DeviceBase from HA device registry when BLE advertisement is absent."""
     device_reg = dr.async_get(hass)
-    if hasattr(device_reg, "async_get_device_by_identifier"):
-        device_entry = device_reg.async_get_device_by_identifier((DOMAIN, address))
-    else:
-        device_entry = device_reg.async_get_device(identifiers={(DOMAIN, address)})
+    device_entry = device_reg.async_get_device(identifiers={(DOMAIN, address)})
     if device_entry is None or not device_entry.serial_number:
         return None
 
@@ -172,6 +169,7 @@ class CloudFallbackBridge:
                 mqtt_client.message_handler = _wrapped_on_mqtt_message
 
         callbacks.add(self._on_raw_mqtt)
+        self.device.update_state("bluetooth_connected", False)
         self._schedule_periodic_get_all()
         self.device._schedule_missing_field_defaults(ConnectionState.AUTHENTICATED)
         _LOGGER.info(
@@ -373,7 +371,7 @@ async def async_try_setup_cloud_fallback(
     """Attempt to set up or attach a CloudFallbackBridge for an unreachable BLE device."""
     device: DeviceBase | None = getattr(entry, "runtime_data", None)
     if device is None:
-        device = create_device_from_registry(hass, address)
+        device = create_device_from_registry(hass, address, getattr(entry, 'entry_id', None))
         if device is None:
             return None
         entry.runtime_data = device
